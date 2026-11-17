@@ -1,5 +1,7 @@
 # Cup Shadow
 
+**Live:** https://lukori.github.io/cup-shadow/ (tuning: https://lukori.github.io/cup-shadow/?debug)
+
 A disposable cup gets a fake, living shadow on the phone screen. Point the iPhone at the cup standing on the printed coaster:
 
 - **Normal:** a regular-looking cup shadow on the table. It breathes slightly and once in a while its far end "peeks" (`life`).
