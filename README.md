@@ -4,8 +4,8 @@
 
 A disposable cup gets a fake, living shadow on the phone screen. Point the iPhone at the cup standing on the printed coaster:
 
-- **Normal:** a regular-looking cup shadow on the table. It breathes slightly and once in a while its far end "peeks" (`life`).
-- **Hand comes near the cup:** the shadow turns into a dog's head silhouette (shadow-puppet style, with an eye hole). It growls (louder the closer the hand is), ears prick up, and when the hand gets very close it barks: mouth snaps open and the head lunges forward.
+- **Normal:** two regular-looking cup shadows, right-back and left-back (as if lit by two lamps). It breathes slightly and once in a while its far end "peeks" (`life`).
+- **Hand comes near the cup:** each shadow turns into a dog's head silhouette (shadow-puppet style, with an eye hole). It growls (louder the closer the hand is), ears prick up, and when the hand gets very close it barks: mouth snaps open and the head lunges forward.
 - **Hand goes away:** after `calmDelay` seconds the dog shrinks back into the cup's shadow.
 - **Blow on the phone ("poo" into the mic):** the shadow grows into a flower with a soft chime, for `flowerTime` seconds. A blow beats the dog; if the hand is still near when the flower ends, the dog comes back.
 
@@ -28,8 +28,9 @@ Web page, no app: open it in Safari on the iPhone, tap **התחלה**, allow cam
 
 - **Tracking:** MindAR follows the printed coaster (not the cup: a smooth cup is too hard to track). The cup is assumed to stand in the middle of the coaster, on the dashed circle. The coaster's red arrow is its "top": place the coaster so the arrow points **away from where people stand** (the cup hides whatever is behind it).
 - **Shadow:** drawn into a texture lying flat on the table around the coaster. An invisible cup-shaped object hides the part of the shadow that is behind the real cup.
-- **Hand:** MediaPipe hand tracking. "Nearness" = how close the nearest hand point is to the cup **on screen**, measured in cup sizes (the cup's outline on screen), so it works at any phone distance. A hand that looks much bigger than the cup (`handMax`) is near the phone, not the cup, and is ignored.
-- **Blow:** the mic level (dB) plus how noise-like the sound is (spectral flatness). Blowing is loud, flat noise; speech is not flat. The mic is ignored while our own bark/chime plays.
+- **Zone sensor (main trigger since v2):** spots on the table in two rings around the cup, fixed to the coaster. Each spot remembers its usual colour; a hand (or its shadow) covering spots changes them. Outer ring covered = growl, inner ring = bark. Spots hidden behind the cup are skipped, one stray spot is ignored. Added because on the iPhone the hand model only noticed the hand once it was already over the cup.
+- **Hand:** MediaPipe hand tracking (detection made more willing in v2: confidence 0.4 → 0.25). Nearness = the stronger of hand model and zone sensor. "Nearness" = how close the nearest hand point is to the cup **on screen**, measured in cup sizes (the cup's outline on screen), so it works at any phone distance. A hand that looks much bigger than the cup (`handMax`) is near the phone, not the cup, and is ignored.
+- **Blow:** loud (dB) AND either noise-like (flatness) OR mostly low rumble (`blowLow`). On the iPhone a blow straight on the mic measured -10 to -18 dB, flatness ~0.00, low ~0.97, so the rumble rule is what catches it. The mic is ignored while our own bark/chime plays.
 
 ## Sounds and art
 
@@ -39,12 +40,13 @@ The shapes are drawn in code in `shadow.js` (dog profile points `DOG_HEAD` / `DO
 
 ## Tuning
 
-Add `?debug` to the address: live numbers (fps, tracking, hand nearness, mic dB/flatness), test buttons (dog / bark / flower / calm), **guides** (green = coaster outline, orange = where the app thinks the cup is), +/- per value (the address updates, copy it to keep the tuning), Copy/Save log. In debug mode, holding a finger (or the mouse) on the screen acts as a pretend hand at that spot, to try the dog without the hand model.
+Add `?debug` to the address: live numbers (fps, tracking, hand nearness, mic dB/flatness), test buttons (dog / bark / flower / calm), **guides** (green = coaster outline, orange = where the app thinks the cup is), +/- per value (the address updates, copy it to keep the tuning), Copy/Save log (Save log goes to the Files app → Downloads; Copy log is easier). In debug mode, holding a finger (or the mouse) on the screen acts as a pretend hand at that spot, to try the dog without the hand model.
 
 | param | default | what it does |
 |---|---|---|
 | cupH / cupTop / cupBot | 95 / 80 / 56 mm | size of the real cup: set to the actual cup (check with guides) |
-| shadowDeg | -50 (front-right; was 25: the dog ended up behind the cup, and at -10 the flower ran off a portrait screen) | direction the shadow falls. 0 = toward the coaster's right edge, 90 = toward the red arrow, -90 = toward the viewer. Anything pointing to 90 (behind the cup) gets hidden by the cup. At the venue, match the real shadows in the room |
+| shadowDeg | 20 (right, a little behind; was -50 front-right in v1, you asked for side + slightly behind) | direction the shadow falls. 0 = toward the coaster's right edge, 90 = toward the red arrow, -90 = toward the viewer. Anything pointing to 90 (behind the cup) gets hidden by the cup. At the venue, match the real shadows in the room |
+| twin | 1 | 1 = second, mirrored shadow on the left (`180 - shadowDeg`, dog looks the other way). 0 = only the right one |
 | dogFace | -1 | which way the dog looks: -1 = toward the viewer, 1 = away |
 | shadowLen | 0.8 (was 1.1: ran off the coaster and off screen) | shadow length / cup height (1 = light at 45°) |
 | shadowDark | 0.5 | darkness |
@@ -59,8 +61,12 @@ Add `?debug` to the address: live numbers (fps, tracking, hand nearness, mic dB/
 | barkGap | 0.9 s | time between barks |
 | steady | 6 | hand nearness smoothing (lower = steadier but slower) |
 | handEvery | 70 ms | time between hand detections (raise if the phone gets slow/hot) |
+| zoneGain | 1 | strength of the zone sensor (0 = off) |
+| zoneDiff | 35 | colour change for a spot to count as covered (raise if it triggers by itself) |
+| zoneFrac | 0.12 | share of a ring covered that counts as fully near (lower = more sensitive) |
 | blowDb | -24 dB | how loud a blow must be |
 | blowFlat | 0.15 (was 0.3: a test blow-like noise measured 0.29; a voice-like tone measured 0.00) | how noise-like (speech is lower) |
+| blowLow | 0.85 | or: share of low rumble that counts as a blow |
 | blowHold | 0.15 s | how long the blow must last |
 | flowerTime | 5 s | how long the flower stays |
 | volume | 0.8 | sound volume |

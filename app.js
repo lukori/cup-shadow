@@ -13,7 +13,8 @@ const DEFAULT_PARAMS = {
   cupTop:     [80, 50, 110, 2, 'cup top diameter mm'],
   cupBot:     [56, 35, 90, 2, 'cup bottom diameter mm'],
   // shadow look
-  shadowDeg:  [-50, -180, 180, 10, 'direction the shadow falls (0 = right edge of coaster, 90 = toward the red arrow, -90 = toward the viewer)'],
+  shadowDeg:  [20, -180, 180, 10, 'direction the right shadow falls (0 = right edge of coaster, 90 = toward the red arrow / away from viewer, -90 = toward the viewer)'],
+  twin:       [1, 0, 1, 1, '1 = a second, mirrored shadow on the left (two lights); 0 = one shadow'],
   shadowLen:  [0.8, 0.3, 3, 0.1, 'shadow length / cup height (1 = light at 45 deg)'],
   shadowDark: [0.5, 0.1, 0.9, 0.05, 'how dark the shadow is'],
   shadowSoft: [4, 0, 40, 1, 'edge blur (pixels of the shadow texture)'],
@@ -33,9 +34,14 @@ const DEFAULT_PARAMS = {
   barkGap:    [0.9, 0.3, 3, 0.1, 'seconds between barks'],
   steady:     [6, 1, 20, 1, 'hand nearness smoothing (lower = steadier, slower)'],
   handEvery:  [70, 30, 300, 10, 'ms between hand detections (higher = lighter on the phone)'],
+  // zone sensor: watches spots on the table around the cup; anything covering them counts as a hand
+  zoneGain:   [1, 0, 2, 0.1, 'strength of the zone sensor (0 = off, hand model only)'],
+  zoneDiff:   [35, 10, 120, 5, 'how much a spot must change colour to count as covered'],
+  zoneFrac:   [0.12, 0.04, 0.8, 0.02, 'share of covered spots in a ring that counts as fully near'],
   // blow
   blowDb:     [-24, -60, 0, 2, 'mic loudness (dB) that counts as a blow'],
   blowFlat:   [0.15, 0.02, 0.9, 0.01, 'how noise-like the sound must be (speech is low)'],
+  blowLow:    [0.85, 0.3, 1, 0.05, 'or: share of low rumble that counts as a blow (blowing right on the mic)'],
   blowHold:   [0.15, 0.05, 1, 0.05, 'seconds the blow must last'],
   flowerTime: [5, 1, 20, 0.5, 'seconds the flower stays'],
   // sound
@@ -114,7 +120,7 @@ function showError(html) { $('err').innerHTML = html; $('err').style.display = '
 
 function buildScene() {
   anchor = mindar.addAnchor(0);
-  anchor.onTargetFound = () => { tracked = true; $('hint').style.opacity = 0; };
+  anchor.onTargetFound = () => { tracked = true; ZONE.ref = null; ZONE.samples = 0; $('hint').style.opacity = 0; };
   anchor.onTargetLost = () => { tracked = false; $('hint').style.opacity = 1; };
 
   // invisible cup: hides the part of the shadow that is behind the real cup
@@ -177,7 +183,7 @@ async function loadHands() {
     const opts = (delegate) => ({
       baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task', delegate },
       runningMode: 'VIDEO', numHands: 2,
-      minHandDetectionConfidence: 0.4, minHandPresenceConfidence: 0.4, minTrackingConfidence: 0.4,
+      minHandDetectionConfidence: 0.25, minHandPresenceConfidence: 0.3, minTrackingConfidence: 0.3,
     });
     try { landmarker = await HandLandmarker.createFromOptions(fileset, opts('GPU')); }
     catch { landmarker = await HandLandmarker.createFromOptions(fileset, opts('CPU')); }
@@ -224,6 +230,85 @@ function cupOnScreen() {
   return { x0, y0, x1, y1, size };
 }
 
+// ---- zone sensor ---------------------------------------------------------
+// Spots on the table in two rings around the cup (fixed to the coaster, so the
+// phone may move). Each spot remembers its usual colour; a hand (or its shadow)
+// over a spot changes it. Spots hidden behind the cup are skipped.
+const ZONE = { cv: document.createElement('canvas'), ref: null, inner: 0, outer: 0, near: 0, last: 0, n: [0, 0] };
+ZONE.ctx = ZONE.cv.getContext('2d', { willReadFrequently: true });
+function zoneSpots() {
+  const pts = [];
+  const r1 = (P.cupBot / 2 + 20) / COASTER_MM, r2 = (P.cupBot / 2 + 44) / COASTER_MM;
+  for (let i = 0; i < 18; i++) { const a = (i / 18) * Math.PI * 2; pts.push([Math.cos(a) * r1, Math.sin(a) * r1, 0]); }
+  for (let i = 0; i < 26; i++) { const a = (i / 26) * Math.PI * 2 + 0.1; pts.push([Math.cos(a) * r2, Math.sin(a) * r2, 1]); }
+  return pts;
+}
+const toScreen = (x, y, z) => {
+  _v.set(x, y, z).applyMatrix4(anchor.group.matrixWorld).project(camera);
+  return [(_v.x + 1) / 2 * renderer.domElement.clientWidth, (1 - _v.y) / 2 * renderer.domElement.clientHeight];
+};
+function hull(p) { // convex hull (monotone chain)
+  p = p.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const q of p) { while (lo.length >= 2 && cr(lo[lo.length - 2], lo[lo.length - 1], q) <= 0) lo.pop(); lo.push(q); }
+  for (const q of p.reverse()) { while (up.length >= 2 && cr(up[up.length - 2], up[up.length - 1], q) <= 0) up.pop(); up.push(q); }
+  return lo.slice(0, -1).concat(up.slice(0, -1));
+}
+function inside(poly, x, y) {
+  let c = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i], [xj, yj] = poly[j];
+    if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c;
+  }
+  return c;
+}
+function senseZone(nowMs) {
+  const video = mindar.video;
+  if (!tracked || !video || video.readyState < 2 || P.zoneGain <= 0) { ZONE.near = 0; ZONE.inner = ZONE.outer = 0; return; }
+  if (nowMs - ZONE.last < 80) return;
+  ZONE.last = nowMs;
+  const W = 96, H = Math.round(96 * video.videoHeight / video.videoWidth);
+  if (ZONE.cv.width !== W || ZONE.cv.height !== H) { ZONE.cv.width = W; ZONE.cv.height = H; ZONE.ref = null; }
+  ZONE.ctx.drawImage(video, 0, 0, W, H); // small = blurred, so tracking jitter matters less
+  const img = ZONE.ctx.getImageData(0, 0, W, H).data;
+  const left = parseFloat(video.style.left) || 0, top = parseFloat(video.style.top) || 0;
+  const vw = parseFloat(video.style.width) || innerWidth, vh = parseFloat(video.style.height) || innerHeight;
+  // the cup's outline on screen: spots inside it are hidden by the cup
+  const h = P.cupH / COASTER_MM, rt = P.cupTop / 2 / COASTER_MM, rb = P.cupBot / 2 / COASTER_MM;
+  const cupPts = [];
+  for (let i = 0; i < 12; i++) { const a = (i / 12) * Math.PI * 2; cupPts.push(toScreen(Math.cos(a) * rb * 1.1, Math.sin(a) * rb * 1.1, 0), toScreen(Math.cos(a) * rt * 1.1, Math.sin(a) * rt * 1.1, h)); }
+  const cupPoly = hull(cupPts);
+  const spots = zoneSpots();
+  if (!ZONE.ref || ZONE.ref.length !== spots.length) ZONE.ref = spots.map(() => null);
+  const cov = [0, 0], tot = [0, 0];
+  spots.forEach(([x, y, ring], i) => {
+    const [sx, sy] = toScreen(x, y, 0);
+    if (inside(cupPoly, sx, sy)) { ZONE.ref[i] = null; return; }
+    const px = Math.round((sx - left) / vw * W), py = Math.round((sy - top) / vh * H);
+    if (px < 1 || py < 1 || px >= W - 1 || py >= H - 1) return;
+    const o = (py * W + px) * 4;
+    const c = [img[o], img[o + 1], img[o + 2]];
+    const r = ZONE.ref[i];
+    tot[ring]++;
+    if (!r) { ZONE.ref[i] = c; return; }
+    const diff = (Math.abs(c[0] - r[0]) + Math.abs(c[1] - r[1]) + Math.abs(c[2] - r[2])) / 3;
+    const covered = diff > P.zoneDiff;
+    if (covered) cov[ring]++;
+    // slowly learn the usual colour (light changes); very slowly while covered
+    const k = covered ? 0.008 : 0.12;
+    for (let j = 0; j < 3; j++) r[j] += (c[j] - r[j]) * k;
+  });
+  ZONE.n = tot;
+  // one stray spot is ignored (tracking wobble); the first ~0.5 s after locking on only learns
+  ZONE.samples = (ZONE.samples || 0) + 1;
+  const warm = ZONE.samples > 6;
+  ZONE.inner = warm && tot[0] >= 4 ? Math.max(0, cov[0] - 1) / tot[0] : 0;
+  ZONE.outer = warm && tot[1] >= 4 ? Math.max(0, cov[1] - 1) / tot[1] : 0;
+  // outer ring covered = coming near (growl); inner ring = right at the cup (bark)
+  ZONE.near = Math.max(0.6 * smooth(ZONE.outer / P.zoneFrac), smooth(ZONE.inner / P.zoneFrac)) * P.zoneGain;
+}
+
 function measureNear() {
   if (!tracked || (!hands.length && !fakeHand)) { S.nearRaw = 0; S.handDist = 99; S.ratio = 0; return; }
   const cup = cupOnScreen();
@@ -246,6 +331,7 @@ function measureNear() {
   }
   S.nearRaw = best; S.handDist = bestD; S.ratio = bestR;
 }
+function nearNow() { return Math.min(1, Math.max(S.nearRaw, ZONE.near)); }
 
 // debug: hold a finger / the mouse on the screen = a pretend hand at that spot
 let fakeHand = null;
@@ -277,13 +363,14 @@ function frame() {
   if (tracked) detectHands(nowMs);
   else hands = [];
   measureNear();
-  S.near += (S.nearRaw - S.near) * (1 - Math.exp(-dt * P.steady));
+  senseZone(nowMs);
+  S.near += (nearNow() - S.near) * (1 - Math.exp(-dt * P.steady));
 
   // ---- blow
   if (blow) {
     blow.update();
     const mine = t < sound.busyUntil;
-    const isBlow = !mine && blow.db > P.blowDb && blow.flat > P.blowFlat;
+    const isBlow = !mine && blow.db > P.blowDb && (blow.flat > P.blowFlat || blow.low > P.blowLow);
     S.blowFor = isBlow ? S.blowFor + dt : 0;
     if (S.blowFor > P.blowHold) {
       if (t > S.flowerUntil) { sound.bloom(); S.blows++; }
@@ -333,22 +420,26 @@ function drawShadow(t) {
   mctx.clearRect(0, 0, TEX, TEX);
   // mm -> texture pixels, y flipped so the texture matches the table (y = toward the red arrow)
   const k = TEX / (PLANE * COASTER_MM);
-  const a = P.shadowDeg * Math.PI / 180;
-  mctx.setTransform(k, 0, 0, -k, TEX / 2, TEX / 2);
-  mctx.rotate(a);
-  mctx.fillStyle = '#000'; mctx.strokeStyle = '#000';
-
-  const sinceBark = t - S.lastBark;
-  const barkEnv = sinceBark < 0.06 ? sinceBark / 0.06 : Math.max(0, 1 - (sinceBark - 0.06) / 0.22);
+  // right shadow, plus (twin) its mirror image on the left, as if lit by two lamps.
+  // The twin barks a moment later and breathes out of step, so they feel like two dogs.
+  const shadows = [{ deg: P.shadowDeg, face: P.dogFace, lag: 0, phase: 0 }];
+  if (P.twin >= 0.5) shadows.push({ deg: 180 - P.shadowDeg, face: -P.dogFace, lag: 0.13, phase: 5.3 });
   const growlAmt = S.state === 'dog' ? smooth((S.near - P.calmAt) / Math.max(0.05, P.barkAt - P.calmAt)) : 0;
-
-  drawCup(mctx, { rBot: P.cupBot / 2, rTop: P.cupTop / 2, len, k: smooth(S.wCup), t, life: P.life });
-  drawDog(mctx, {
-    H: len * P.dogSize, k: S.wDog, face: P.dogFace,
-    jaw: Math.max(barkEnv, 0.12 * growlAmt), ear: 0.3 + 0.7 * Math.max(growlAmt, barkEnv),
-    shake: growlAmt * (1 - barkEnv), lunge: barkEnv, t, blink: t < S.blink,
-  });
-  drawFlower(mctx, { H: len * P.flowerSize, k: S.wFlower, t, sway: 1 });
+  for (const sh of shadows) {
+    mctx.setTransform(k, 0, 0, -k, TEX / 2, TEX / 2);
+    mctx.rotate(sh.deg * Math.PI / 180);
+    mctx.fillStyle = '#000'; mctx.strokeStyle = '#000';
+    const tt = t + sh.phase;
+    const sinceBark = t - S.lastBark - sh.lag;
+    const barkEnv = sinceBark < 0 ? 0 : sinceBark < 0.06 ? sinceBark / 0.06 : Math.max(0, 1 - (sinceBark - 0.06) / 0.22);
+    drawCup(mctx, { rBot: P.cupBot / 2, rTop: P.cupTop / 2, len, k: smooth(S.wCup), t: tt, life: P.life });
+    drawDog(mctx, {
+      H: len * P.dogSize, k: S.wDog, face: sh.face,
+      jaw: Math.max(barkEnv, 0.12 * growlAmt), ear: 0.3 + 0.7 * Math.max(growlAmt, barkEnv),
+      shake: growlAmt * (1 - barkEnv), lunge: barkEnv, t: tt, blink: t < S.blink,
+    });
+    drawFlower(mctx, { H: len * P.flowerSize, k: S.wFlower, t: tt, sway: 1 });
+  }
 
   // soft edges: draw the mask's own blurred shadow, offset so only the shadow lands
   sctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -419,6 +510,7 @@ function liveNumbers() {
     fps: fps.toFixed(0), tracked, state: S.state,
     near: S.near.toFixed(2), nearRaw: S.nearRaw.toFixed(2), handDist: S.handDist.toFixed(2), handRatio: S.ratio.toFixed(2),
     hands: hands.length, handMs: handMs.toFixed(0), handModel: landmarker ? 'ok' : 'loading',
+    zoneIn: ZONE.inner.toFixed(2), zoneOut: ZONE.outer.toFixed(2), zoneNear: ZONE.near.toFixed(2), zoneSpots: ZONE.n.join('+'),
     micDb: blow ? blow.db.toFixed(1) : 'off', micFlat: blow ? blow.flat.toFixed(2) : '-', micLow: blow ? blow.low.toFixed(2) : '-',
     blows: S.blows, audio: sound.ctx ? sound.ctx.state : '-',
   };
@@ -430,6 +522,7 @@ function updateTune(t) {
     `fps ${L.fps}  tracked ${L.tracked}  state ${L.state}\n` +
     `near ${L.near} (raw ${L.nearRaw})  dist ${L.handDist}  hand/cup ${L.handRatio}\n` +
     `hands ${L.hands}  ${L.handMs}ms  model ${L.handModel}\n` +
+    `zone in ${L.zoneIn} out ${L.zoneOut} -> ${L.zoneNear}  spots ${L.zoneSpots}\n` +
     `mic ${L.micDb} dB  flat ${L.micFlat}  low ${L.micLow}  blows ${L.blows}  audio ${L.audio}`;
   if (t - lastLog > 0.25) {
     lastLog = t;
