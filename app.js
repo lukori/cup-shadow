@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import 'https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js';
-import { drawCup, drawDog, drawFlower, smooth } from './shadow.js?v=1';
-import { Sound, BlowDetector } from './sound.js?v=1';
+import { drawCup, drawDog, drawRose, smooth } from './shadow.js?v=2';
+import { Sound, BlowDetector } from './sound.js?v=2';
 
 // ------------------------------------------------------------------------
 // Tunable parameters. Any of them can be set in the address: ?shadowDeg=40
@@ -12,17 +12,23 @@ const DEFAULT_PARAMS = {
   cupH:       [95, 60, 160, 5, 'cup height mm'],
   cupTop:     [80, 50, 110, 2, 'cup top diameter mm'],
   cupBot:     [56, 35, 90, 2, 'cup bottom diameter mm'],
+  cupX:       [0, -40, 40, 1, 'cup position: mm to the right of the coaster centre (if the cup is not exactly on the circle)'],
+  cupY:       [0, -40, 40, 1, 'cup position: mm toward the red arrow'],
+  // steadiness of the picture (on top of the tracker's own filter)
+  poseSteady: [4, 0.5, 30, 0.5, 'how fast the shadow follows small tracking wobble (lower = calmer)'],
+  poseFollow: [30, 2, 60, 2, 'how fast it follows real phone movement (higher = less lag)'],
   // shadow look
   shadowDeg:  [20, -180, 180, 10, 'direction the right shadow falls (0 = right edge of coaster, 90 = toward the red arrow / away from viewer, -90 = toward the viewer)'],
   twin:       [1, 0, 1, 1, '1 = a second, mirrored shadow on the left (two lights); 0 = one shadow'],
   shadowLen:  [0.8, 0.3, 3, 0.1, 'shadow length / cup height (1 = light at 45 deg)'],
   shadowDark: [0.5, 0.1, 0.9, 0.05, 'how dark the shadow is'],
-  shadowSoft: [4, 0, 40, 1, 'edge blur (pixels of the shadow texture)'],
+  shadowSoft: [6, 0, 40, 1, 'edge blur (pixels of the shadow texture)'],
   life:       [1, 0, 3, 0.25, 'idle breathing / peeking of the normal shadow'],
   morph:      [3, 0.5, 10, 0.5, 'speed of changing shape (per second)'],
   dogFace:    [-1, -1, 1, 2, 'which way the dog looks: -1 = toward the viewer (red arrow points away from people), 1 = away'],
   dogSize:    [1.25, 0.6, 2.5, 0.05, 'dog height / normal shadow length'],
-  flowerSize: [1.4, 0.6, 3, 0.05, 'flower height / normal shadow length'],
+  roseSize:   [95, 50, 200, 5, 'rose: outer radius in mm (the cup is its centre)'],
+  bloomTime:  [2.2, 0.5, 6, 0.1, 'seconds the rose takes to open'],
   // hand
   nearD:      [0.1, 0, 2, 0.05, 'hand this close (in cup sizes on screen) = fully near'],
   farD:       [1.0, 0.3, 5, 0.1, 'hand this far (in cup sizes) = not near at all'],
@@ -38,6 +44,7 @@ const DEFAULT_PARAMS = {
   zoneGain:   [1, 0, 2, 0.1, 'strength of the zone sensor (0 = off, hand model only)'],
   zoneDiff:   [35, 10, 120, 5, 'how much a spot must change colour to count as covered'],
   zoneFrac:   [0.12, 0.04, 0.8, 0.02, 'share of covered spots in a ring that counts as fully near'],
+  zoneStill:  [0.025, 0.005, 0.3, 0.005, 'while the coaster moves on screen more than this, the zone sensor only learns (no false hands)'],
   // blow
   blowDb:     [-24, -60, 0, 2, 'mic loudness (dB) that counts as a blow'],
   blowFlat:   [0.15, 0.02, 0.9, 0.01, 'how noise-like the sound must be (speech is low)'],
@@ -72,7 +79,7 @@ const mask = document.createElement('canvas'); mask.width = mask.height = TEX;
 const shadowCanvas = document.createElement('canvas'); shadowCanvas.width = shadowCanvas.height = TEX;
 const mctx = mask.getContext('2d');
 const sctx = shadowCanvas.getContext('2d');
-let shadowTex, occluder, guides;
+let shadowTex, occluder, guides, stage, cupG, plane;
 
 // behaviour state
 const S = {
@@ -80,12 +87,12 @@ const S = {
   dog: false, awayFor: 0, nextBark: 0, lastBark: -9,
   flowerUntil: -1, blowFor: 0, blows: 0,
   wCup: 1, wDog: 0, wFlower: 0, state: 'cup',
-  blink: 0,
+  blink: 0, roseK: 0,
 };
 
 // ------------------------------------------------------------------------
 $('go').addEventListener('click', start, { once: true });
-if (DEBUG) { buildTune(); window.__cs = { P, S, shadowCanvas, cupOnScreen: () => cupOnScreen() }; }
+if (DEBUG) { buildTune(); window.__cs = { P, S, shadowCanvas, cupOnScreen: () => cupOnScreen(), get ZONE() { return ZONE; } }; }
 
 async function start() {
   $('go').textContent = '...';
@@ -97,7 +104,7 @@ async function start() {
       container: $('ar'),
       imageTargetSrc: 'assets/coaster.mind',
       uiScanning: 'no', uiLoading: 'yes', uiError: 'yes',
-      filterMinCF: 0.0005, filterBeta: 0.01, // steadier than the default, a little more lag
+      filterMinCF: 0.001, filterBeta: 1, // light filter here; our own pose smoothing (poseSteady/poseFollow) does the rest
       missTolerance: 8, warmupTolerance: 3,
     });
     ({ renderer, scene, camera } = mindar);
@@ -121,7 +128,12 @@ function showError(html) { $('err').innerHTML = html; $('err').style.display = '
 function buildScene() {
   anchor = mindar.addAnchor(0);
   anchor.onTargetFound = () => { tracked = true; ZONE.ref = null; ZONE.samples = 0; $('hint').style.opacity = 0; };
-  anchor.onTargetLost = () => { tracked = false; $('hint').style.opacity = 1; };
+  anchor.onTargetLost = () => { tracked = false; POSE.lostAt = performance.now() / 1000; $('hint').style.opacity = 1; };
+  // what we draw hangs on our own smoothed copy of the tracked pose (see followPose)
+  stage = new THREE.Group(); stage.matrixAutoUpdate = false; stage.visible = false;
+  scene.add(stage);
+  cupG = new THREE.Group(); // the cup's spot on the coaster (cupX / cupY)
+  stage.add(cupG);
 
   // invisible cup: hides the part of the shadow that is behind the real cup
   occluder = new THREE.Mesh(
@@ -130,17 +142,17 @@ function buildScene() {
   );
   occluder.rotation.x = Math.PI / 2;
   occluder.renderOrder = -1;
-  anchor.group.add(occluder);
+  cupG.add(occluder);
 
   shadowTex = new THREE.CanvasTexture(shadowCanvas);
   shadowTex.colorSpace = THREE.SRGBColorSpace;
   shadowTex.anisotropy = renderer.capabilities.getMaxAnisotropy(); // keeps it sharp when seen at an angle
-  const plane = new THREE.Mesh(
+  plane = new THREE.Mesh(
     new THREE.PlaneGeometry(PLANE, PLANE),
     new THREE.MeshBasicMaterial({ map: shadowTex, transparent: true, depthWrite: false }),
   );
   plane.renderOrder = 1;
-  anchor.group.add(plane);
+  cupG.add(plane);
 
   if (DEBUG) {
     guides = new THREE.Group();
@@ -148,7 +160,7 @@ function buildScene() {
       new THREE.EdgesGeometry(new THREE.PlaneGeometry(1, 1)),
       new THREE.LineBasicMaterial({ color: 0x00ff88 }),
     );
-    guides.add(sq);
+    stage.add(sq); guides.sq = sq;
     guides.cup = new THREE.LineSegments(
       new THREE.EdgesGeometry(new THREE.CylinderGeometry(1, 1, 1, 16, 1)),
       new THREE.LineBasicMaterial({ color: 0xffaa00 }),
@@ -156,7 +168,7 @@ function buildScene() {
     guides.cup.rotation.x = Math.PI / 2;
     guides.add(guides.cup);
     guides.visible = false;
-    anchor.group.add(guides);
+    cupG.add(guides);
   }
   updateCupGeometry();
 }
@@ -167,6 +179,7 @@ function updateCupGeometry() {
   occluder.geometry.dispose(); occluder.geometry = g;
   occluder.scale.set(1, 1, 1);
   occluder.position.set(0, 0, h / 2);
+  cupG.position.set(P.cupX / COASTER_MM, P.cupY / COASTER_MM, 0);
   if (guides) {
     guides.cup.geometry.dispose();
     guides.cup.geometry = new THREE.EdgesGeometry(new THREE.CylinderGeometry(rt, rb, h, 16, 1));
@@ -217,14 +230,11 @@ function cupOnScreen() {
   }
   let bottom = null, topP = null;
   for (const [x, y, z] of pts) {
-    _v.set(x, y, z).applyMatrix4(anchor.group.matrixWorld).project(camera);
-    const sx = (_v.x + 1) / 2 * W, sy = (1 - _v.y) / 2 * H;
+    const [sx, sy] = toScreen(x, y, z);
     x0 = Math.min(x0, sx); x1 = Math.max(x1, sx); y0 = Math.min(y0, sy); y1 = Math.max(y1, sy);
   }
-  _v.set(0, 0, 0).applyMatrix4(anchor.group.matrixWorld).project(camera);
-  bottom = [(_v.x + 1) / 2 * W, (1 - _v.y) / 2 * H];
-  _v.set(0, 0, h).applyMatrix4(anchor.group.matrixWorld).project(camera);
-  topP = [(_v.x + 1) / 2 * W, (1 - _v.y) / 2 * H];
+  bottom = toScreen(0, 0, 0);
+  topP = toScreen(0, 0, h);
   // cup size on screen: the bigger side of its outline (works from the side and from above)
   const size = Math.max(x1 - x0, y1 - y0, Math.hypot(topP[0] - bottom[0], topP[1] - bottom[1]), 1);
   return { x0, y0, x1, y1, size };
@@ -243,10 +253,11 @@ function zoneSpots() {
   for (let i = 0; i < 26; i++) { const a = (i / 26) * Math.PI * 2 + 0.1; pts.push([Math.cos(a) * r2, Math.sin(a) * r2, 1]); }
   return pts;
 }
-const toScreen = (x, y, z) => {
-  _v.set(x, y, z).applyMatrix4(anchor.group.matrixWorld).project(camera);
+// coaster point (relative to the cup's spot) -> screen pixels, using the raw tracked pose
+function toScreen(x, y, z) {
+  _v.set(x + P.cupX / COASTER_MM, y + P.cupY / COASTER_MM, z).applyMatrix4(anchor.group.matrixWorld).project(camera);
   return [(_v.x + 1) / 2 * renderer.domElement.clientWidth, (1 - _v.y) / 2 * renderer.domElement.clientHeight];
-};
+}
 function hull(p) { // convex hull (monotone chain)
   p = p.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
   const cr = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
@@ -265,7 +276,7 @@ function inside(poly, x, y) {
 }
 function senseZone(nowMs) {
   const video = mindar.video;
-  if (!tracked || !video || video.readyState < 2 || P.zoneGain <= 0) { ZONE.near = 0; ZONE.inner = ZONE.outer = 0; return; }
+  if (!tracked || !video || video.readyState < 2 || P.zoneGain <= 0) { ZONE.near = 0; ZONE.inner = ZONE.outer = 0; ZONE.prev = null; return; }
   if (nowMs - ZONE.last < 80) return;
   ZONE.last = nowMs;
   const W = 96, H = Math.round(96 * video.videoHeight / video.videoWidth);
@@ -274,6 +285,18 @@ function senseZone(nowMs) {
   const img = ZONE.ctx.getImageData(0, 0, W, H).data;
   const left = parseFloat(video.style.left) || 0, top = parseFloat(video.style.top) || 0;
   const vw = parseFloat(video.style.width) || innerWidth, vh = parseFloat(video.style.height) || innerHeight;
+  // How much did the coaster move on screen since the last look (in half coaster widths)?
+  // While it moves (phone moving, or the tracker still settling after it locks on) the spots
+  // slide over the busy print and everything looks "covered". Then we only learn, never count.
+  // (centre and two edges, so turning around the cup counts as moving too)
+  const cs = [toScreen(0, 0, 0), toScreen(0.5, 0, 0), toScreen(0, 0.5, 0)];
+  const scale = Math.max(1, Math.hypot(cs[1][0] - cs[0][0], cs[1][1] - cs[0][1]));
+  ZONE.moved = ZONE.prev ? Math.max(...cs.map((c, i) => Math.hypot(c[0] - ZONE.prev[i][0], c[1] - ZONE.prev[i][1]))) / scale : 1;
+  ZONE.prev = cs;
+  ZONE.still = ZONE.moved < P.zoneStill ? (ZONE.still || 0) + 1 : 0;
+  ZONE.samples = (ZONE.samples || 0) + 1;
+  // counting starts 1.2 s after locking on, and only once the picture has been still for 0.4 s
+  const counting = ZONE.samples > 15 && ZONE.still >= 5;
   // the cup's outline on screen: spots inside it are hidden by the cup
   const h = P.cupH / COASTER_MM, rt = P.cupTop / 2 / COASTER_MM, rb = P.cupBot / 2 / COASTER_MM;
   const cupPts = [];
@@ -281,30 +304,46 @@ function senseZone(nowMs) {
   const cupPoly = hull(cupPts);
   const spots = zoneSpots();
   if (!ZONE.ref || ZONE.ref.length !== spots.length) ZONE.ref = spots.map(() => null);
-  const cov = [0, 0], tot = [0, 0];
-  spots.forEach(([x, y, ring], i) => {
+  const cov = spots.map(() => null); // null = not seen, false = clear, true = covered
+  spots.forEach(([x, y], i) => {
     const [sx, sy] = toScreen(x, y, 0);
     if (inside(cupPoly, sx, sy)) { ZONE.ref[i] = null; return; }
     const px = Math.round((sx - left) / vw * W), py = Math.round((sy - top) / vh * H);
-    if (px < 1 || py < 1 || px >= W - 1 || py >= H - 1) return;
-    const o = (py * W + px) * 4;
-    const c = [img[o], img[o + 1], img[o + 2]];
+    if (px < 2 || py < 2 || px >= W - 2 || py >= H - 2) return;
+    // average of a 3x3 patch: a pixel of tracking wobble barely changes it
+    const c = [0, 0, 0];
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const o = ((py + dy) * W + px + dx) * 4;
+      c[0] += img[o] / 9; c[1] += img[o + 1] / 9; c[2] += img[o + 2] / 9;
+    }
     const r = ZONE.ref[i];
-    tot[ring]++;
     if (!r) { ZONE.ref[i] = c; return; }
-    const diff = (Math.abs(c[0] - r[0]) + Math.abs(c[1] - r[1]) + Math.abs(c[2] - r[2])) / 3;
-    const covered = diff > P.zoneDiff;
-    if (covered) cov[ring]++;
-    // slowly learn the usual colour (light changes); very slowly while covered
-    const k = covered ? 0.008 : 0.12;
+    // biggest change in any colour channel: skin over the print is mostly a change of hue
+    const diff = Math.max(Math.abs(c[0] - r[0]), Math.abs(c[1] - r[1]), Math.abs(c[2] - r[2]));
+    const covered = counting && diff > P.zoneDiff;
+    cov[i] = covered; (ZONE.diffs ||= [])[i] = Math.round(diff);
+    // learn the usual colour: fast while not counting (moving / just locked on); very slowly
+    // for a spot that changed even half-way (a hand held still stays a hand for ~30 s)
+    const k = !counting ? 0.3 : diff > P.zoneDiff * 0.5 ? 0.002 : 0.12;
     for (let j = 0; j < 3; j++) r[j] += (c[j] - r[j]) * k;
   });
-  ZONE.n = tot;
-  // one stray spot is ignored (tracking wobble); the first ~0.5 s after locking on only learns
-  ZONE.samples = (ZONE.samples || 0) + 1;
-  const warm = ZONE.samples > 6;
-  ZONE.inner = warm && tot[0] >= 4 ? Math.max(0, cov[0] - 1) / tot[0] : 0;
-  ZONE.outer = warm && tot[1] >= 4 ? Math.max(0, cov[1] - 1) / tot[1] : 0;
+  // A real hand covers spots next to each other; wobble flips scattered single spots.
+  // So a covered spot only counts if a neighbour in its ring is covered too.
+  const rings = [[0, 18], [18, 44]];
+  const share = rings.map(([a, b]) => {
+    const n = b - a;
+    let tot = 0, hit = 0;
+    for (let i = a; i < b; i++) {
+      if (cov[i] === null) continue;
+      tot++;
+      const prv = cov[a + (i - a + n - 1) % n], nxt = cov[a + (i - a + 1) % n];
+      if (cov[i] && (prv || nxt)) hit++;
+    }
+    return { tot, f: tot >= 4 ? hit / tot : 0 };
+  });
+  ZONE.n = share.map((q) => q.tot);
+  if (counting) { ZONE.inner = share[0].f; ZONE.outer = share[1].f; }
+  else { ZONE.inner *= 0.8; ZONE.outer *= 0.8; } // moving: let the last reading fade, don't invent one
   // outer ring covered = coming near (growl); inner ring = right at the cup (bark)
   ZONE.near = Math.max(0.6 * smooth(ZONE.outer / P.zoneFrac), smooth(ZONE.inner / P.zoneFrac)) * P.zoneGain;
 }
@@ -350,6 +389,35 @@ if (DEBUG) {
   ar.addEventListener('pointercancel', () => { fakeHand = null; });
 }
 
+
+// ---- steady picture ---------------------------------------------------------
+// The tracker's pose wobbles a little even when nothing moves. We keep our own copy:
+// it creeps toward the tracked pose slowly when the difference is tiny (wobble) and
+// catches up fast when it is big (the phone really moved).
+const POSE = { p: new THREE.Vector3(), q: new THREE.Quaternion(), s: new THREE.Vector3(), has: false, vis: 0, lostAt: -9 };
+const _tp = new THREE.Vector3(), _tq = new THREE.Quaternion(), _ts = new THREE.Vector3();
+function followPose(dt, t) {
+  if (tracked) {
+    anchor.group.updateMatrixWorld();
+    anchor.group.matrixWorld.decompose(_tp, _tq, _ts);
+    if (!POSE.has) { POSE.p.copy(_tp); POSE.q.copy(_tq); POSE.s.copy(_ts); POSE.has = true; }
+    // difference in coaster widths (+ angle in radians)
+    const d = _tp.distanceTo(POSE.p) / Math.max(1e-6, _ts.x) + POSE.q.angleTo(_tq) * 0.5;
+    const rate = P.poseSteady + (P.poseFollow - P.poseSteady) * smooth(d / 0.04);
+    const a = 1 - Math.exp(-dt * rate);
+    POSE.p.lerp(_tp, a); POSE.q.slerp(_tq, a); POSE.s.lerp(_ts, a);
+    POSE.vis = Math.min(1, POSE.vis + dt * 4);
+  } else {
+    // lost: hold still for a moment (a hand passing in front), then fade out
+    if (t - POSE.lostAt > 0.35) POSE.vis = Math.max(0, POSE.vis - dt * 3);
+    if (POSE.vis === 0) POSE.has = false;
+  }
+  stage.matrix.compose(POSE.p, POSE.q, POSE.s);
+  stage.matrixWorldNeedsUpdate = true;
+  stage.visible = POSE.has && POSE.vis > 0;
+  plane.material.opacity = smooth(POSE.vis);
+}
+
 // ------------------------------------------------------------------------
 let lastT = performance.now(), fps = 0, lastDraw = 0;
 
@@ -360,6 +428,7 @@ function frame() {
   fps += (1 / Math.max(dt, 1e-3) - fps) * 0.05;
   const t = nowMs / 1000;
 
+  followPose(dt, t);
   if (tracked) detectHands(nowMs);
   else hands = [];
   measureNear();
@@ -389,6 +458,7 @@ function frame() {
 
   if (S.state === 'dog' && S.near > P.barkAt && t > S.nextBark && S.wDog > 0.7) {
     sound.bark();
+    if (P.twin >= 0.5) sound.bark({ delay: 0.13, rate: 0.86, gain: 0.7 }); // the second dog answers
     S.lastBark = t;
     S.nextBark = t + P.barkGap * (0.75 + Math.random() * 0.5);
   }
@@ -400,16 +470,18 @@ function frame() {
   const step = dt * P.morph;
   const go = (w, on) => on ? Math.min(1, w + step) : Math.max(0, w - step);
   // the old shape shrinks first, then the new one grows (no muddy overlap)
-  const others = { cup: S.wDog + S.wFlower, dog: S.wCup + S.wFlower, flower: S.wCup + S.wDog };
+  const others = { cup: S.wDog + Math.max(S.wFlower, S.roseK), dog: S.wCup + Math.max(S.wFlower, S.roseK), flower: S.wCup + S.wDog };
   S.wCup = go(S.wCup, S.state === 'cup' && others.cup < 0.35);
   S.wDog = go(S.wDog, S.state === 'dog' && others.dog < 0.35);
   S.wFlower = go(S.wFlower, S.state === 'flower' && others.flower < 0.35);
+  // the rose opens slowly and closes a little faster
+  S.roseK = S.wFlower > 0.5 && S.state === 'flower' ? Math.min(1, S.roseK + dt / P.bloomTime) : Math.max(0, S.roseK - dt / 1.1);
 
   if (Math.random() < dt * 0.3) S.blink = t + 0.12;
 
   // redraw the shadow at most ~40 fps
   if (nowMs - lastDraw > 24) { lastDraw = nowMs; drawShadow(t); }
-  if (guides) guides.visible = tuneGuides;
+  if (guides) { guides.visible = tuneGuides; guides.sq.visible = tuneGuides; }
   renderer.render(scene, camera);
   if (DEBUG) updateTune(t);
 }
@@ -438,8 +510,10 @@ function drawShadow(t) {
       jaw: Math.max(barkEnv, 0.12 * growlAmt), ear: 0.3 + 0.7 * Math.max(growlAmt, barkEnv),
       shake: growlAmt * (1 - barkEnv), lunge: barkEnv, t: tt, blink: t < S.blink,
     });
-    drawFlower(mctx, { H: len * P.flowerSize, k: S.wFlower, t: tt, sway: 1 });
   }
+  // the rose: one flower with the cup as its middle
+  mctx.setTransform(k, 0, 0, -k, TEX / 2, TEX / 2);
+  drawRose(mctx, { R: P.roseSize, r0: P.cupBot / 2, k: S.roseK, t });
 
   // soft edges: draw the mask's own blurred shadow, offset so only the shadow lands
   sctx.setTransform(1, 0, 0, 1, 0, 0);
@@ -483,7 +557,7 @@ function buildTune() {
   $('t-min').onclick = () => { tuneMin = !tuneMin; el.classList.toggle('min', tuneMin); $('t-min').textContent = tuneMin ? 'values' : 'fold'; };
   $('t-guides').onclick = () => { tuneGuides = !tuneGuides; };
   $('t-dog').onclick = () => { S.dog = true; S.awayFor = -3; };
-  $('t-bark').onclick = () => { S.dog = true; S.awayFor = -3; sound.bark(); S.lastBark = performance.now() / 1000; };
+  $('t-bark').onclick = () => { S.dog = true; S.awayFor = -3; sound.bark(); if (P.twin >= 0.5) sound.bark({ delay: 0.13, rate: 0.86, gain: 0.7 }); S.lastBark = performance.now() / 1000; };
   $('t-flower').onclick = () => { sound.bloom(); S.flowerUntil = performance.now() / 1000 + P.flowerTime; };
   $('t-calm').onclick = () => { S.dog = false; S.flowerUntil = -1; };
   $('t-copy').onclick = async () => { try { await navigator.clipboard.writeText(logText()); $('t-copy').textContent = 'copied'; } catch { $('t-copy').textContent = 'failed'; } };
@@ -510,7 +584,7 @@ function liveNumbers() {
     fps: fps.toFixed(0), tracked, state: S.state,
     near: S.near.toFixed(2), nearRaw: S.nearRaw.toFixed(2), handDist: S.handDist.toFixed(2), handRatio: S.ratio.toFixed(2),
     hands: hands.length, handMs: handMs.toFixed(0), handModel: landmarker ? 'ok' : 'loading',
-    zoneIn: ZONE.inner.toFixed(2), zoneOut: ZONE.outer.toFixed(2), zoneNear: ZONE.near.toFixed(2), zoneSpots: ZONE.n.join('+'),
+    zoneIn: ZONE.inner.toFixed(2), zoneOut: ZONE.outer.toFixed(2), zoneNear: ZONE.near.toFixed(2), zoneSpots: ZONE.n.join('+'), zoneMoved: (ZONE.moved ?? 0).toFixed(3), zoneStill: ZONE.still || 0,
     micDb: blow ? blow.db.toFixed(1) : 'off', micFlat: blow ? blow.flat.toFixed(2) : '-', micLow: blow ? blow.low.toFixed(2) : '-',
     blows: S.blows, audio: sound.ctx ? sound.ctx.state : '-',
   };
@@ -522,7 +596,7 @@ function updateTune(t) {
     `fps ${L.fps}  tracked ${L.tracked}  state ${L.state}\n` +
     `near ${L.near} (raw ${L.nearRaw})  dist ${L.handDist}  hand/cup ${L.handRatio}\n` +
     `hands ${L.hands}  ${L.handMs}ms  model ${L.handModel}\n` +
-    `zone in ${L.zoneIn} out ${L.zoneOut} -> ${L.zoneNear}  spots ${L.zoneSpots}\n` +
+    `zone in ${L.zoneIn} out ${L.zoneOut} -> ${L.zoneNear}  spots ${L.zoneSpots}  moved ${L.zoneMoved}\n` +
     `mic ${L.micDb} dB  flat ${L.micFlat}  low ${L.micLow}  blows ${L.blows}  audio ${L.audio}`;
   if (t - lastLog > 0.25) {
     lastLog = t;

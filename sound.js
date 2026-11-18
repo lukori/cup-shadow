@@ -1,6 +1,7 @@
-// Sounds: synthesised placeholders. To use real recordings, put files in
-// sounds/ named bark.mp3, growl.mp3 (a loop) and bloom.mp3; they replace the
-// synthesised versions automatically.
+// Sounds. Real recordings in sounds/ are used when they exist:
+//   bark1.mp3, bark2.mp3, ... (any number, one is picked at random each time; or a single bark.mp3)
+//   growl.mp3 (played as a loop), bloom.mp3
+// Anything missing falls back to a synthesised version.
 
 export class Sound {
   constructor() {
@@ -29,9 +30,18 @@ export class Sound {
   resume() { if (this.ctx && this.ctx.state !== 'running') this.ctx.resume(); }
 
   async _loadFiles() {
+    // numbered barks: load until the first missing number
+    this.barks = [];
+    for (let i = 1; i <= 20; i++) {
+      try {
+        const r = await fetch(`sounds/bark${i}.mp3`, { cache: 'no-cache' });
+        if (!r.ok) break;
+        this.barks.push(await this.ctx.decodeAudioData(await r.arrayBuffer()));
+      } catch (e) { break; }
+    }
     for (const name of ['bark', 'growl', 'bloom']) {
       try {
-        const r = await fetch(`sounds/${name}.mp3`, { cache: 'no-store' });
+        const r = await fetch(`sounds/${name}.mp3`, { cache: 'no-cache' });
         if (!r.ok) continue;
         this.files[name] = await this.ctx.decodeAudioData(await r.arrayBuffer());
         if (name === 'growl') this._startGrowl(true);
@@ -49,21 +59,31 @@ export class Sound {
 
   _mark(sec) { this.busyUntil = Math.max(this.busyUntil, performance.now() / 1000 + sec + 0.25); }
 
-  _playFile(name, vol = 1) {
+  _playBuffer(buf, { vol = 1, rate = 1, delay = 0 } = {}) {
     const s = this.ctx.createBufferSource();
-    s.buffer = this.files[name];
+    s.buffer = buf;
+    s.playbackRate.value = rate;
     const g = this.ctx.createGain();
     g.gain.value = vol * this.volume;
     s.connect(g).connect(this.master);
-    s.start();
-    this._mark(s.buffer.duration);
+    s.start(this.ctx.currentTime + delay);
+    this._mark(delay + buf.duration / rate);
   }
 
-  bark() {
+  // opts: { delay (s), rate (pitch/speed, 1 = as recorded), gain }
+  bark(opts = {}) {
     if (!this.ctx) return;
-    if (this.files.bark) return this._playFile('bark');
-    const c = this.ctx, t = c.currentTime, v = this.volume;
-    const pitch = 0.85 + Math.random() * 0.3;
+    const { delay = 0, rate = 1, gain = 1 } = opts;
+    const pool = this.barks?.length ? this.barks : this.files.bark ? [this.files.bark] : null;
+    if (pool) {
+      // never the same bark twice in a row, and a slightly different pitch each time
+      let i = Math.floor(Math.random() * pool.length);
+      if (pool.length > 1 && i === this._lastBark) i = (i + 1) % pool.length;
+      this._lastBark = i;
+      return this._playBuffer(pool[i], { vol: gain, rate: rate * (0.94 + Math.random() * 0.12), delay });
+    }
+    const c = this.ctx, t = c.currentTime + delay, v = this.volume * gain;
+    const pitch = (0.85 + Math.random() * 0.3) * rate;
     // voiced part: falling sawtooth through a "mouth" filter
     const o = c.createOscillator();
     o.type = 'sawtooth';
@@ -90,7 +110,7 @@ export class Sound {
     n.connect(nf).connect(ng).connect(this.master);
     o.start(t); o.stop(t + 0.25);
     n.start(t); n.stop(t + 0.2);
-    this._mark(0.25);
+    this._mark(delay + 0.25);
   }
 
   _startGrowl(fromFile = false) {
@@ -128,25 +148,41 @@ export class Sound {
   // level 0..1, called every frame
   setGrowl(level) {
     if (!this.growl) return;
-    const target = Math.max(0, Math.min(1, level)) * 0.35 * this.volume;
+    const target = Math.max(0, Math.min(1, level)) * (this.files.growl ? 0.8 : 0.35) * this.volume;
     this.growl.out.gain.setTargetAtTime(target, this.ctx.currentTime, 0.12);
   }
 
+  // the rose opening: a soft breath of air with a warm, slow swell under it (no bells)
   bloom() {
     if (!this.ctx) return;
-    if (this.files.bloom) return this._playFile('bloom');
+    if (this.files.bloom) return this._playBuffer(this.files.bloom);
     const c = this.ctx, t = c.currentTime, v = this.volume;
-    [1046.5, 1318.5, 1568, 2093].forEach((fr, i) => {
-      const o = c.createOscillator(); o.type = 'sine'; o.frequency.value = fr;
+    // air: noise through a slowly opening band filter, like petals unfolding
+    const n = c.createBufferSource(); n.buffer = this._noise; n.loop = true;
+    const bp = c.createBiquadFilter(); bp.type = 'bandpass'; bp.Q.value = 0.7;
+    bp.frequency.setValueAtTime(350, t);
+    bp.frequency.exponentialRampToValueAtTime(1800, t + 1.6);
+    bp.frequency.exponentialRampToValueAtTime(900, t + 3.2);
+    const ng = c.createGain();
+    ng.gain.setValueAtTime(0.0001, t);
+    ng.gain.exponentialRampToValueAtTime(0.16 * v, t + 0.9);
+    ng.gain.exponentialRampToValueAtTime(0.0001, t + 3.4);
+    n.connect(bp).connect(ng).connect(this.master);
+    n.start(t); n.stop(t + 3.5);
+    // warm swell: a low open fifth, gently detuned, rising in slowly
+    [[196, -4], [196, 5], [293.7, 0], [392, 3]].forEach(([fr, cents], i) => {
+      const o = c.createOscillator(); o.type = i === 2 ? 'triangle' : 'sine';
+      o.frequency.value = fr; o.detune.value = cents;
+      const lp = c.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900;
       const g = c.createGain();
-      const t0 = t + 0.12 + i * 0.11;
+      const t0 = t + 0.15 + i * 0.18;
       g.gain.setValueAtTime(0.0001, t0);
-      g.gain.exponentialRampToValueAtTime(0.25 * v, t0 + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 1.4);
-      o.connect(g).connect(this.master);
-      o.start(t0); o.stop(t0 + 1.5);
+      g.gain.exponentialRampToValueAtTime((i === 3 ? 0.035 : 0.07) * v, t0 + 1.2);
+      g.gain.exponentialRampToValueAtTime(0.0001, t0 + 3.6);
+      o.connect(lp).connect(g).connect(this.master);
+      o.start(t0); o.stop(t0 + 3.7);
     });
-    this._mark(1.8);
+    this._mark(1.5);
   }
 }
 

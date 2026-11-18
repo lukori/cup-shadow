@@ -169,4 +169,94 @@ export function drawFlower(ctx, g) {
   }
 }
 
+// ---- rose -------------------------------------------------------------------
+// One rose lying on the table with the cup standing in its middle, seen from above.
+// Like a real rose: a few broad petals per ring, each ring turned against the last,
+// inner petals lying on top of the outer ones. A thin light seam along each petal's
+// edge shows the layers. Rings open from the middle outward; each petal unfurls
+// (grows outward, widens, untwists).
+const ROSE_RINGS = [ // count, base (0 = cup edge, 1 = rose edge), tip, twist when closed
+  [5, 0.30, 1.00, 0.35],
+  [5, 0.18, 0.80, 0.45],
+  [5, 0.08, 0.60, 0.55],
+  [4, 0.00, 0.42, 0.7],
+  [3, 0.00, 0.26, 0.9],
+];
+const ROSE_PETALS = (() => {
+  // fixed pseudo-random numbers, so the rose looks the same every time
+  let seed = 11;
+  const rnd = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647; };
+  const out = [];
+  ROSE_RINGS.forEach(([n, b, tip, twist], j) => {
+    const turn = j * 0.63 + rnd() * 0.2; // each ring sits between the petals of the next
+    for (let i = 0; i < n; i++) {
+      out.push({
+        ring: ROSE_RINGS.length - 1 - j, // 0 = innermost (opens first)
+        b, tip: tip * (0.94 + rnd() * 0.08), twist,
+        a: turn + (i / n) * Math.PI * 2 + (rnd() - 0.5) * 0.12,
+        w: (Math.PI / n) * (1.12 + rnd() * 0.12), // half-width: overlaps the neighbours
+        seed: rnd() * 100,
+      });
+    }
+  });
+  return out; // outer ring first: inner petals are drawn on top
+})();
+
+function petalPath(g, p, o) {
+  const span = g.R - g.r0;
+  const breathe = 1 + 0.012 * Math.sin(g.t * 0.9 + p.seed);
+  const rb = g.r0 * 0.75 + span * p.b;
+  const rt = (rb + (g.r0 + span * p.tip - rb) * (0.15 + 0.85 * o)) * breathe;
+  const th = p.w * (0.4 + 0.6 * o);
+  const a0 = p.a + p.twist * (1 - o) + 0.01 * Math.sin(g.t * 0.6 + p.seed);
+  const L = rt - rb;
+  const side = [];
+  for (let s = 0; s <= 0.75; s += 0.15) {
+    // narrow at the base, full width from about the middle
+    const hw = th * (0.3 + 0.7 * Math.pow(Math.sin(Math.min(1, s / 0.6) * Math.PI / 2), 0.9));
+    side.push([rb + L * s, hw]);
+  }
+  // broad, rounded top edge with a soft dip in the middle (heart-like rose petal)
+  const top = [];
+  for (let i = 0; i <= 10; i++) {
+    const f = -1 + i / 5; // -1 .. 1
+    const r = rt * (1 - 0.13 * Math.pow(Math.abs(f), 2.2))
+      + 0.015 * rt * Math.sin(f * 3.1 + p.seed)
+      - 0.035 * rt * Math.exp(-(f * f) / 0.02);
+    top.push([r, f * th]);
+  }
+  const polar = [...side.map(([r, h]) => [r, a0 - h]), ...top.map(([r, h]) => [r, a0 + h]),
+    ...side.slice().reverse().map(([r, h]) => [r, a0 + h])];
+  return { pts: polar.map(([r, a]) => [r * Math.cos(a), r * Math.sin(a)]),
+    rim: top.map(([r, h]) => [(r - 0.6) * Math.cos(a0 + h), (r - 0.6) * Math.sin(a0 + h)]) };
+}
+
+export function drawRose(ctx, g) {
+  // g: { R (outer radius mm), r0 (cup base radius mm), k 0..1 (open), t }
+  if (g.k <= 0.001) return;
+  ctx.save();
+  ctx.rotate(0.15 * (1 - smooth(g.k)) + 0.008 * Math.sin(g.t * 0.4));
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for (const p of ROSE_PETALS) {
+    const o = smooth((g.k - p.ring * 0.12) / 0.52); // inner rings open first
+    if (o <= 0.001) continue;
+    const { pts, rim } = petalPath(g, p, o);
+    const fade = smooth(o * 3);
+    ctx.globalAlpha = 0.62 * fade;
+    ctx.beginPath();
+    blob(ctx, pts);
+    ctx.fill();
+    // light seam along the petal's edge: lets the light through between layers
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.globalAlpha = 0.55 * fade;
+    ctx.lineWidth = 1.3;
+    ctx.beginPath();
+    rim.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.stroke();
+    ctx.restore();
+  }
+  ctx.restore();
+}
+
 export { smooth };
