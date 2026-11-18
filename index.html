@@ -11,7 +11,7 @@
   #start { position: fixed; inset: 0; z-index: 20; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; background: #1b130e; text-align: center; padding: 24px; }
   #start h1 { font-weight: 600; letter-spacing: .02em; margin: 0; font-size: 28px; }
   #start p { margin: 0; opacity: .75; line-height: 1.5; font-size: 15px; max-width: 320px; }
-  #go { margin-top: 10px; width: 120px; height: 120px; border-radius: 50%; border: 0; background: #b84626; color: #fff; font-size: 20px; font-weight: 600; }
+  #go { width: 120px; height: 120px; border-radius: 50%; border: 0; background: #b84626; color: #fff; font-size: 20px; font-weight: 600; }
   #hint { position: fixed; left: 0; right: 0; bottom: calc(28px + env(safe-area-inset-bottom)); z-index: 10; text-align: center; font-size: 15px; pointer-events: none; transition: opacity .4s; }
   #hint span { background: rgba(0,0,0,.45); padding: 8px 14px; border-radius: 20px; }
   #err { position: fixed; inset: 0; z-index: 30; display: none; align-items: center; justify-content: center; padding: 30px; text-align: center; background: #1b130e; line-height: 1.6; }
@@ -28,13 +28,8 @@
 </head>
 <body>
 <div id="ar"></div>
-<div id="start">
-  <h1>Cup Shadow</h1>
-  <p>כוונו את המצלמה אל הכוס והתחתית.<br>קרבו יד אל הכוס, או נשפו על הטלפון.</p>
-  <button id="go">התחלה</button>
-  <p style="font-size:12px;opacity:.5">צריך אישור למצלמה ולמיקרופון</p>
-</div>
-<div id="hint" style="opacity:0"><span>כוונו אל התחתית</span></div>
+<div id="start"><button id="go" aria-label="start"></button></div>
+<div id="hint" style="display:none"></div>
 <div id="err"></div>
 <div id="tune"></div>
 
@@ -44,6 +39,6 @@
   "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
 } }
 </script>
-<script type="module" src="app.js?v=3"></script>
+<script type="module" src="app.js?v=4"></script>
 </body>
 </html>

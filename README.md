@@ -9,7 +9,7 @@ A disposable cup gets a fake, living shadow on the phone screen. Point the iPhon
 - **Hand goes away:** after `calmDelay` seconds the dog shrinks back into the cup's shadow.
 - **Blow on the phone ("poo" into the mic):** the shadows give way to a rose opening around the cup, the cup standing as its middle (petals unfold ring by ring from the middle out, over `bloomTime` seconds), with a soft breath-and-swell sound. It stays `flowerTime` seconds, then closes. A blow beats the dog; if the hand is still near when the rose ends, the dog comes back.
 
-Web page, no app: open it in Safari on the iPhone, tap **התחלה**, allow camera and microphone. Should also work on Android Chrome (not tested).
+Web page, no app: open it in Safari on the iPhone, tap the red button (the start screen is only an empty red button, no text, since v4), allow camera and microphone. No on-screen hints during use either. Should also work on Android Chrome (not tested).
 
 ## Files
 

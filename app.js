@@ -95,7 +95,7 @@ $('go').addEventListener('click', start, { once: true });
 if (DEBUG) { buildTune(); window.__cs = { P, S, shadowCanvas, cupOnScreen: () => cupOnScreen(), get ZONE() { return ZONE; } }; }
 
 async function start() {
-  $('go').textContent = '...';
+  $('go').style.opacity = 0.5;
   sound.volume = P.volume;
   sound.unlock();
   try {
